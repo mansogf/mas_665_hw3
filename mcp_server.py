@@ -3,41 +3,34 @@
 MCP Server — Brazilian Public Job Competitions
 - Async scraping with cache + periodic refresh
 - Exposes MCP tools
-- Dual transport: STDIO (for Claude Desktop, etc.) and HTTP (for cloud hosts)
+- Dual transport: STDIO (local) and HTTP (cloud)
 
 Usage
 -----
-STDIO (default when run as a script):
+Local (STDIO, para Cursor/Claude abrirem via subprocess):
     TRANSPORT=stdio python mcp_server.py
 
-HTTP (for Railway/Render/etc.):
-    TRANSPORT=http PORT=8000 HOST=0.0.0.0 uvicorn mcp_server:http_app --host 0.0.0.0 --port 8000
-    # or simply: python mcp_server.py  (if TRANSPORT=http)
+Cloud (HTTP, para Railway/Render etc.):
+    TRANSPORT=http uvicorn mcp_server:http_app --host 0.0.0.0 --port $PORT
 
-Notes
+Notas
 -----
-- The HTTP transport requires `mcp.server.http` (part of the `mcp` package).
-- For cloud deploys, prefer the HTTP transport and start with an ASGI server (uvicorn).
+- O transporte HTTP requer `mcp.server.http` (do pacote `mcp`).
+- Em cloud, rode SEMPRE via ASGI server (uvicorn) e `TRANSPORT=http`.
 """
 
 import asyncio
 import json
 import logging
 import os
-from typing import Dict, List, Any, Optional
-from datetime import datetime
+import time
+from typing import Dict, List, Any
 
 import httpx
 from bs4 import BeautifulSoup
+
 from mcp.server import Server
 from mcp.types import Tool, TextContent
-
-# Optional HTTP transport (available in recent mcp versions)
-try:
-    import mcp.server.http  # provides app_from_server(...)
-    _HTTP_AVAILABLE = True
-except Exception:
-    _HTTP_AVAILABLE = False
 
 # -------------------------------------------------------------------
 # Logging
@@ -46,7 +39,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(level
 logger = logging.getLogger("mcp-competitions-br")
 
 # -------------------------------------------------------------------
-# Data cache
+# Estados e cache
 # -------------------------------------------------------------------
 competitions_data: Dict[str, List[Dict[str, str]]] = {}
 
@@ -60,16 +53,13 @@ STATES: Dict[str, str] = {
     "se": "Sergipe", "to": "Tocantins"
 }
 
-# Guards for update loop
 _update_loop_started = False
 _first_update_done = False
-
 
 # -------------------------------------------------------------------
 # Scraping & Cache
 # -------------------------------------------------------------------
 async def fetch_and_extract_data(state: str, client: httpx.AsyncClient) -> List[Dict[str, str]]:
-    """Fetches minimal competition data for a given state."""
     url = f"https://concursosnobrasil.com/concursos/{state}/"
     headers = {
         "User-Agent": (
@@ -77,7 +67,6 @@ async def fetch_and_extract_data(state: str, client: httpx.AsyncClient) -> List[
             "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         )
     }
-
     try:
         resp = await client.get(url, headers=headers, timeout=30.0)
         if resp.status_code != 200:
@@ -118,7 +107,6 @@ async def fetch_and_extract_data(state: str, client: httpx.AsyncClient) -> List[
                     "url": competition_url,
                 }
             )
-
         return out
 
     except httpx.TimeoutException:
@@ -130,11 +118,10 @@ async def fetch_and_extract_data(state: str, client: httpx.AsyncClient) -> List[
 
 
 async def periodic_update_task():
-    """Refresh all states once."""
     logger.info("🔄 Starting competitions update")
     async with httpx.AsyncClient() as client:
         tasks = [fetch_and_extract_data(s, client) for s in STATES.keys()]
-        results = await asyncio.gather(*tasks)
+        results = await asyncio.gather(*tasks, return_exceptions=False)
 
     updated = 0
     for s, data in zip(STATES.keys(), results):
@@ -146,7 +133,6 @@ async def periodic_update_task():
 
 
 async def update_loop():
-    """Keep refreshing every hour."""
     global _first_update_done
     while True:
         await periodic_update_task()
@@ -155,7 +141,6 @@ async def update_loop():
 
 
 def process_competitions_data(state: str) -> Dict[str, Any]:
-    """Split cached data into open vs scheduled."""
     data = competitions_data.get(state, [])
     if not data:
         return {
@@ -185,12 +170,10 @@ def process_competitions_data(state: str) -> Dict[str, Any]:
         "total_scheduled": len(scheduled_list),
     }
 
-
 # -------------------------------------------------------------------
 # MCP Server & Tools
 # -------------------------------------------------------------------
 mcp_server = Server("competitions-brasil")
-
 
 @mcp_server.list_tools()
 async def list_tools() -> List[Tool]:
@@ -234,12 +217,11 @@ async def list_tools() -> List[Tool]:
         ),
     ]
 
-
 @mcp_server.call_tool()
 async def call_tool(name: str, arguments: dict) -> List[TextContent]:
     global _update_loop_started
 
-    # Ensure the update loop runs at least once.
+    # Garante atualização inicial
     if not _update_loop_started:
         _update_loop_started = True
         asyncio.create_task(update_loop())
@@ -254,15 +236,10 @@ async def call_tool(name: str, arguments: dict) -> List[TextContent]:
     if name == "get_competitions":
         state = (arguments or {}).get("state", "").lower()
         if not state or state not in STATES:
-            return [
-                TextContent(
-                    type="text",
-                    text=json.dumps(
-                        {"error": f"Invalid state '{state}'. Use one of: {', '.join(STATES.keys())}"},
-                        ensure_ascii=False,
-                    ),
-                )
-            ]
+            return [TextContent(type="text", text=json.dumps(
+                {"error": f"Invalid state '{state}'. Use one of: {', '.join(STATES.keys())}"},
+                ensure_ascii=False,
+            ))]
         result = process_competitions_data(state)
         return [TextContent(type="text", text=json.dumps(result, indent=2, ensure_ascii=False))]
 
@@ -272,68 +249,94 @@ async def call_tool(name: str, arguments: dict) -> List[TextContent]:
         for code in STATES.keys():
             result = process_competitions_data(code)
             if filter_open_only:
-                out.append(
-                    {
-                        "state": result["state"],
-                        "state_code": result["state_code"],
-                        "open_competitions": result.get("open_competitions", []),
-                        "total_open": result.get("total_open", 0),
-                    }
-                )
+                out.append({
+                    "state": result["state"],
+                    "state_code": result["state_code"],
+                    "open_competitions": result.get("open_competitions", []),
+                    "total_open": result.get("total_open", 0),
+                })
             else:
-                out.append(
-                    {
-                        "state": result["state"],
-                        "state_code": result["state_code"],
-                        "total_open": result.get("total_open", 0),
-                        "total_scheduled": result.get("total_scheduled", 0),
-                    }
-                )
+                out.append({
+                    "state": result["state"],
+                    "state_code": result["state_code"],
+                    "total_open": result.get("total_open", 0),
+                    "total_scheduled": result.get("total_scheduled", 0),
+                })
         return [TextContent(type="text", text=json.dumps(out, indent=2, ensure_ascii=False))]
 
     return [TextContent(type="text", text=json.dumps({"error": f"Unknown tool: {name}"}))]
-
 
 # -------------------------------------------------------------------
 # Transport glue (STDIO & HTTP)
 # -------------------------------------------------------------------
 def _env_transport() -> str:
-    """Return 'stdio' or 'http'."""
     v = os.getenv("TRANSPORT", "").strip().lower()
     if v in {"stdio", "http"}:
         return v
-    # heuristic: if running under uvicorn/gunicorn import path, prefer HTTP
-    return "http" if os.getenv("UVICORN_WORKER") or os.getenv("DYNO") else "stdio"
-
+    return "stdio"
 
 async def _run_stdio():
-    """Run the server over STDIO (for local MCP hosts)."""
     import mcp.server.stdio
     logger.info("Starting MCP (STDIO) …")
     async with mcp.server.stdio.stdio_server() as (read_stream, write_stream):
         await mcp_server.run(read_stream, write_stream, mcp_server.create_initialization_options())
 
+# ---------- HTTP: cria ASGI + health wrapper ----------
+# Importa o transporte HTTP e constrói o app no import (para uvicorn "module:var")
+_HTTP_AVAILABLE = False
+try:
+    import mcp.server.http  # precisa existir nessa versão do pacote 'mcp'
+    _HTTP_AVAILABLE = True
+except Exception as e:
+    logger.warning("mcp.server.http not available: %s", e)
 
-def _create_asgi_app():
-    """Build an ASGI app for HTTP transport."""
-    if not _HTTP_AVAILABLE:
-        raise RuntimeError(
-            "HTTP transport is not available. Please upgrade the 'mcp' package to a version "
-            "that provides 'mcp.server.http'."
-        )
-    # Smithery/hosts expect the MCP-over-HTTP adapter app:
-    return mcp.server.http.app_from_server(mcp_server)
+def _build_http_app_or_fallback():
+    """
+    Monta o app ASGI do MCP e adiciona health handlers (GET/HEAD / e favicon).
+    Se o transporte HTTP não existir, expõe fallback 503 (mas nunca retorna None).
+    """
+    from fastapi import FastAPI
+    from fastapi.responses import JSONResponse, PlainTextResponse, Response
 
+    if _HTTP_AVAILABLE:
+        try:
+            mcp_app = mcp.server.http.app_from_server(mcp_server)
+        except Exception as e:
+            logger.exception("Failed to build MCP HTTP app: %s", e)
+            mcp_app = None
+    else:
+        mcp_app = None
 
-# Expose ASGI app as a module-level variable for uvicorn: `uvicorn mcp_server:http_app`
-http_app = None
-if _HTTP_AVAILABLE:
-    try:
-        http_app = _create_asgi_app()
-    except Exception as _e:
-        # Defer raising until we actually try to run HTTP mode via __main__ or uvicorn
-        logger.debug("Could not create HTTP app at import time: %s", _e)
+    api = FastAPI(title="MCP Wrapper")
 
+    @api.get("/", include_in_schema=False)
+    async def root():
+        return JSONResponse({
+            "ok": True,
+            "service": "mcp-competitions-br",
+            "timestamp": int(time.time()),
+            "note": "POST / is the MCP endpoint.",
+            "http_transport": bool(mcp_app is not None),
+        })
+
+    @api.head("/", include_in_schema=False)
+    async def root_head():
+        return PlainTextResponse("", status_code=200)
+
+    @api.get("/favicon.ico", include_in_schema=False)
+    async def favicon():
+        # evita 404 em health de navegadores / edge
+        return Response(content=b"", media_type="image/x-icon", status_code=200)
+
+    # Se o MCP HTTP estiver disponível, montamos na raiz para capturar POST /
+    if mcp_app is not None:
+        # Nossas rotas GET/HEAD/GET-favicon continuam válidas; POST / cai no MCP.
+        api.mount("/", mcp_app)
+
+    return api
+
+# Exposto para o uvicorn: uvicorn mcp_server:http_app
+http_app = _build_http_app_or_fallback()
 
 # -------------------------------------------------------------------
 # Entrypoint
@@ -341,20 +344,10 @@ if _HTTP_AVAILABLE:
 if __name__ == "__main__":
     transport = _env_transport()
     if transport == "http":
-        if not _HTTP_AVAILABLE:
-            raise SystemExit(
-                "TRANSPORT=http requested but 'mcp.server.http' is not available. "
-                "Upgrade 'mcp' or switch to TRANSPORT=stdio."
-            )
-        # Run an embedded uvicorn if launched directly.
         import uvicorn
-
         host = os.getenv("HOST", "0.0.0.0")
         port = int(os.getenv("PORT", "8000"))
-
-        app = http_app or _create_asgi_app()
         logger.info("Starting MCP (HTTP) on %s:%s …", host, port)
-        uvicorn.run(app, host=host, port=port)
+        uvicorn.run(http_app, host=host, port=port)
     else:
-        # STDIO mode (good for local hosts like Claude Desktop)
         asyncio.run(_run_stdio())
