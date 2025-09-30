@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
 Brazilian Public Job Competitions API - FastAPI
-- Coleta assíncrona com cache + atualização periódica
+- Coleta assíncrona com cache + atualização periódica (APScheduler)
 - Filtros por estado/status/busca
-- Health endpoints para cloud hosting (Railway/Render)
+- Health e favicon para cloud hosting (Railway/Render/etc.)
 """
 
 import asyncio
@@ -27,13 +27,12 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 # Config (ENV)
 # ------------------------------------------------------------------------------
 UPDATE_INTERVAL_SECONDS = int(os.getenv("UPDATE_INTERVAL_SECONDS", "3600"))
-SCRAPE_TIMEOUT_SECONDS = float(os.getenv("SCRAPE_TIMEOUT_SECONDS", "30"))
-# Limitar concorrência para ser gentil com o site alvo
-CONCURRENCY = int(os.getenv("SCRAPE_CONCURRENCY", "8"))
+SCRAPE_TIMEOUT_SECONDS  = float(os.getenv("SCRAPE_TIMEOUT_SECONDS",  "30"))
+SCRAPE_CONCURRENCY      = int(os.getenv("SCRAPE_CONCURRENCY",       "8"))
 USER_AGENT = os.getenv(
     "SCRAPE_USER_AGENT",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/120.0.0.0 Safari/537.36"
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
 
 # ------------------------------------------------------------------------------
@@ -48,7 +47,7 @@ logger = logging.getLogger("api_concursos")
 app = FastAPI(
     title="Brazilian Public Job Competitions API",
     description="Complete API for querying Brazilian public job competitions",
-    version="2.1.0",
+    version="2.2.0",
 )
 
 # Middlewares
@@ -92,7 +91,6 @@ global_statistics = {
     "last_complete_update": None,
 }
 
-# Estados
 STATES: Dict[str, str] = {
     "ac": "Acre", "al": "Alagoas", "ap": "Amapá", "am": "Amazonas",
     "ba": "Bahia", "ce": "Ceará", "df": "Distrito Federal",
@@ -171,7 +169,7 @@ async def periodic_update_task():
     limits = httpx.Limits(max_keepalive_connections=20, max_connections=40)
     async with httpx.AsyncClient(limits=limits) as client:
         tasks = [fetch_and_extract_data(s, client) for s in STATES.keys()]
-        results = await _gather_with_semaphore(tasks, CONCURRENCY)
+        results = await _gather_with_semaphore(tasks, SCRAPE_CONCURRENCY)
 
         successes = 0
         now = datetime.now()
@@ -227,7 +225,7 @@ def process_competitions_data(
         s = search.lower()
         filtered = [c for c in filtered if s in c.organization.lower()]
 
-    open_comp = [asdict(c) for c in filtered if c.status == CompetitionStatus.OPEN]
+    open_comp  = [asdict(c) for c in filtered if c.status == CompetitionStatus.OPEN]
     sched_comp = [asdict(c) for c in filtered if c.status == CompetitionStatus.SCHEDULED]
 
     return {
@@ -255,7 +253,8 @@ async def startup_event():
     _scheduler = AsyncIOScheduler()
     _scheduler.add_job(periodic_update_task, "interval", seconds=UPDATE_INTERVAL_SECONDS, id="refresh")
     _scheduler.start()
-    logger.info("🚀 API started | interval=%ss concurrency=%s timeout=%ss", UPDATE_INTERVAL_SECONDS, CONCURRENCY, SCRAPE_TIMEOUT_SECONDS)
+    logger.info("🚀 API started | interval=%ss concurrency=%s timeout=%ss",
+                UPDATE_INTERVAL_SECONDS, SCRAPE_CONCURRENCY, SCRAPE_TIMEOUT_SECONDS)
 
 @app.on_event("shutdown")
 async def shutdown_event():
@@ -279,8 +278,8 @@ async def root():
     .state-list{{column-count:4;list-style:none;padding:0}}.feature{{background:#ecfccb;padding:1rem;margin:.5rem 0;border-radius:8px}}
     .muted{{color:#6b7280;font-size:.9rem}}</style>
     </head><body>
-    <h1>🎯 Brazilian Public Job Competitions API v2.1</h1>
-    <p class="muted">Update interval: {UPDATE_INTERVAL_SECONDS}s · Concurrency: {CONCURRENCY} · Timeout: {SCRAPE_TIMEOUT_SECONDS}s</p>
+    <h1>🎯 Brazilian Public Job Competitions API v2.2</h1>
+    <p class="muted">Update interval: {UPDATE_INTERVAL_SECONDS}s · Concurrency: {SCRAPE_CONCURRENCY} · Timeout: {SCRAPE_TIMEOUT_SECONDS}s</p>
     <div class="feature"><strong>✨ Features:</strong> Coleta assíncrona, cache por estado, filtros e métricas</div>
     <h2>📍 Endpoints</h2>
     <div class="endpoint"><code>GET /states/{{state}}</code> — por estado<br>
@@ -332,7 +331,7 @@ async def health_check():
     }
 
 @app.get("/states/{state_code}")
-async def get_competitions(
+async def get_competitions_endpoint(
     state_code: str,
     status: Optional[CompetitionStatus] = Query(None, description="Filter by status"),
     search: Optional[str] = Query(None, description="Search by text"),

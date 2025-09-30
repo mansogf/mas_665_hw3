@@ -1,22 +1,19 @@
 #!/usr/bin/env python3
 """
 MCP Server — Brazilian Public Job Competitions
-- Async scraping with cache + periodic refresh
-- Exposes MCP tools
-- Dual transport: STDIO (local) and HTTP (cloud)
+- Scraping assíncrono com cache + atualização periódica
+- Exposição de ferramentas MCP
+- Dois modos de transporte: STDIO (local) e HTTP (cloud)
 
-Usage
------
-Local (STDIO, para Cursor/Claude abrirem via subprocess):
-    TRANSPORT=stdio python mcp_server.py
+HTTP: usa FastMCP com ASGI (Uvicorn) e aceita POST /
+STDIO: ideal para Cursor/Claude rodando localmente
 
-Cloud (HTTP, para Railway/Render etc.):
-    TRANSPORT=http uvicorn mcp_server:http_app --host 0.0.0.0 --port $PORT
+Comandos:
+  # HTTP (Railway/Render/etc.)
+  TRANSPORT=http uvicorn mcp_server:http_app --host 0.0.0.0 --port $PORT
 
-Notas
------
-- O transporte HTTP requer `mcp.server.http` (do pacote `mcp`).
-- Em cloud, rode SEMPRE via ASGI server (uvicorn) e `TRANSPORT=http`.
+  # STDIO (local)
+  TRANSPORT=stdio python mcp_server.py
 """
 
 import asyncio
@@ -29,18 +26,18 @@ from typing import Dict, List, Any
 import httpx
 from bs4 import BeautifulSoup
 
-from mcp.server import Server
-from mcp.types import Tool, TextContent
+# FastMCP (SDK MCP com suporte HTTP/Streamable HTTP e STDIO)
+from fastmcp import FastMCP
 
-# -------------------------------------------------------------------
+# ------------------------------------------------------------------------------
 # Logging
-# -------------------------------------------------------------------
+# ------------------------------------------------------------------------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("mcp-competitions-br")
 
-# -------------------------------------------------------------------
-# Estados e cache
-# -------------------------------------------------------------------
+# ------------------------------------------------------------------------------
+# Estado e cache
+# ------------------------------------------------------------------------------
 competitions_data: Dict[str, List[Dict[str, str]]] = {}
 
 STATES: Dict[str, str] = {
@@ -56,19 +53,24 @@ STATES: Dict[str, str] = {
 _update_loop_started = False
 _first_update_done = False
 
-# -------------------------------------------------------------------
+UPDATE_INTERVAL_SECONDS = int(os.getenv("UPDATE_INTERVAL_SECONDS", "3600"))
+SCRAPE_TIMEOUT_SECONDS = float(os.getenv("SCRAPE_TIMEOUT_SECONDS", "30"))
+CONCURRENCY = int(os.getenv("SCRAPE_CONCURRENCY", "8"))
+USER_AGENT = os.getenv(
+    "SCRAPE_USER_AGENT",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
+
+# ------------------------------------------------------------------------------
 # Scraping & Cache
-# -------------------------------------------------------------------
+# ------------------------------------------------------------------------------
 async def fetch_and_extract_data(state: str, client: httpx.AsyncClient) -> List[Dict[str, str]]:
+    """Busca dados mínimos de concursos para um estado."""
     url = f"https://concursosnobrasil.com/concursos/{state}/"
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        )
-    }
+    headers = {"User-Agent": USER_AGENT}
     try:
-        resp = await client.get(url, headers=headers, timeout=30.0)
+        resp = await client.get(url, headers=headers, timeout=SCRAPE_TIMEOUT_SECONDS)
         if resp.status_code != 200:
             logger.error("HTTP %s for %s", resp.status_code, state.upper())
             return []
@@ -108,7 +110,6 @@ async def fetch_and_extract_data(state: str, client: httpx.AsyncClient) -> List[
                 }
             )
         return out
-
     except httpx.TimeoutException:
         logger.error("Timeout fetching %s", state.upper())
         return []
@@ -118,10 +119,19 @@ async def fetch_and_extract_data(state: str, client: httpx.AsyncClient) -> List[
 
 
 async def periodic_update_task():
+    """Atualiza todos os estados e popula o cache."""
     logger.info("🔄 Starting competitions update")
-    async with httpx.AsyncClient() as client:
-        tasks = [fetch_and_extract_data(s, client) for s in STATES.keys()]
-        results = await asyncio.gather(*tasks, return_exceptions=False)
+    limits = httpx.Limits(max_keepalive_connections=20, max_connections=40)
+    async with httpx.AsyncClient(limits=limits) as client:
+        # limitar concorrência
+        sem = asyncio.Semaphore(CONCURRENCY)
+
+        async def _wrapped(s: str):
+            async with sem:
+                return await fetch_and_extract_data(s, client)
+
+        tasks = [_wrapped(s) for s in STATES.keys()]
+        results = await asyncio.gather(*tasks)
 
     updated = 0
     for s, data in zip(STATES.keys(), results):
@@ -133,28 +143,23 @@ async def periodic_update_task():
 
 
 async def update_loop():
+    """Loop de atualização periódica."""
     global _first_update_done
+    # Primeira coleta
+    await periodic_update_task()
+    _first_update_done = True
+
     while True:
+        await asyncio.sleep(UPDATE_INTERVAL_SECONDS)
         await periodic_update_task()
-        _first_update_done = True
-        await asyncio.sleep(3600)
 
 
 def process_competitions_data(state: str) -> Dict[str, Any]:
+    """Divide em abertas vs previstas."""
     data = competitions_data.get(state, [])
-    if not data:
-        return {
-            "state": STATES[state],
-            "state_code": state,
-            "message": "Data is being collected or not available yet. Try again soon.",
-            "open_competitions": [],
-            "scheduled_competitions": [],
-            "total_open": 0,
-            "total_scheduled": 0,
-        }
-
     open_list: List[Dict[str, Any]] = []
     scheduled_list: List[Dict[str, Any]] = []
+
     for item in data:
         if str(item.get("status", "")).lower() == "scheduled":
             scheduled_list.append(item)
@@ -168,146 +173,87 @@ def process_competitions_data(state: str) -> Dict[str, Any]:
         "scheduled_competitions": scheduled_list,
         "total_open": len(open_list),
         "total_scheduled": len(scheduled_list),
+        "message": None if data else "Data is being collected or not available yet. Try again soon.",
     }
 
-# -------------------------------------------------------------------
-# MCP Server & Tools
-# -------------------------------------------------------------------
-mcp_server = Server("competitions-brasil")
+# ------------------------------------------------------------------------------
+# MCP (FastMCP)
+# ------------------------------------------------------------------------------
+mcp = FastMCP("competitions-brasil")
 
-@mcp_server.list_tools()
-async def list_tools() -> List[Tool]:
-    return [
-        Tool(
-            name="get_competitions",
-            description=(
-                "Return competitions for a Brazilian state. "
-                f"States: {', '.join(k.upper() for k in STATES.keys())}"
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "state": {
-                        "type": "string",
-                        "description": "State code (e.g., sp, rj, mg)",
-                        "enum": list(STATES.keys()),
-                    }
-                },
-                "required": ["state"],
-            },
-        ),
-        Tool(
-            name="list_all_states",
-            description="List all available Brazilian states with their codes.",
-            inputSchema={"type": "object", "properties": {}},
-        ),
-        Tool(
-            name="search_competitions_all",
-            description="Summarize competitions across all states (optionally only open).",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "filter_open_only": {
-                        "type": "boolean",
-                        "description": "If true, include only open competitions in each state’s result.",
-                        "default": False,
-                    }
-                },
-            },
-        ),
-    ]
+# As tools podem ser assíncronas no FastMCP
+@mcp.tool()
+async def list_all_states() -> str:
+    """List all available Brazilian states with their codes (JSON string)."""
+    states_list = [{"state_code": code, "name": name} for code, name in STATES.items()]
+    return json.dumps(states_list, indent=2, ensure_ascii=False)
 
-@mcp_server.call_tool()
-async def call_tool(name: str, arguments: dict) -> List[TextContent]:
-    global _update_loop_started
+@mcp.tool()
+async def get_competitions(state: str) -> str:
+    """Return competitions for a Brazilian state (JSON string)."""
+    global _update_loop_started, _first_update_done
+    s = (state or "").lower()
+    if s not in STATES:
+        return json.dumps({"error": f"Invalid state '{state}'. Use one of: {', '.join(STATES.keys())}"}, ensure_ascii=False)
 
-    # Garante atualização inicial
+    # Garante o loop de atualização em background
     if not _update_loop_started:
         _update_loop_started = True
         asyncio.create_task(update_loop())
-        if not _first_update_done and not competitions_data:
-            logger.info("Running initial data update...")
-            await periodic_update_task()
+    # Na primeira chamada, se ainda não populou nada, espera uma coleta rápida
+    if not _first_update_done and not competitions_data:
+        await periodic_update_task()
+        _first_update_done = True
 
-    if name == "list_all_states":
-        states_list = [{"state_code": code, "name": name} for code, name in STATES.items()]
-        return [TextContent(type="text", text=json.dumps(states_list, indent=2, ensure_ascii=False))]
+    result = process_competitions_data(s)
+    return json.dumps(result, indent=2, ensure_ascii=False)
 
-    if name == "get_competitions":
-        state = (arguments or {}).get("state", "").lower()
-        if not state or state not in STATES:
-            return [TextContent(type="text", text=json.dumps(
-                {"error": f"Invalid state '{state}'. Use one of: {', '.join(STATES.keys())}"},
-                ensure_ascii=False,
-            ))]
-        result = process_competitions_data(state)
-        return [TextContent(type="text", text=json.dumps(result, indent=2, ensure_ascii=False))]
+@mcp.tool()
+async def search_competitions_all(filter_open_only: bool = False) -> str:
+    """Summarize competitions across all states (optionally only open)."""
+    global _update_loop_started, _first_update_done
+    if not _update_loop_started:
+        _update_loop_started = True
+        asyncio.create_task(update_loop())
+    if not _first_update_done and not competitions_data:
+        await periodic_update_task()
+        _first_update_done = True
 
-    if name == "search_competitions_all":
-        filter_open_only = bool((arguments or {}).get("filter_open_only", False))
-        out: List[Dict[str, Any]] = []
-        for code in STATES.keys():
-            result = process_competitions_data(code)
-            if filter_open_only:
-                out.append({
+    out: List[Dict[str, Any]] = []
+    for code in STATES.keys():
+        result = process_competitions_data(code)
+        if filter_open_only:
+            out.append(
+                {
                     "state": result["state"],
                     "state_code": result["state_code"],
                     "open_competitions": result.get("open_competitions", []),
                     "total_open": result.get("total_open", 0),
-                })
-            else:
-                out.append({
+                }
+            )
+        else:
+            out.append(
+                {
                     "state": result["state"],
                     "state_code": result["state_code"],
                     "total_open": result.get("total_open", 0),
                     "total_scheduled": result.get("total_scheduled", 0),
-                })
-        return [TextContent(type="text", text=json.dumps(out, indent=2, ensure_ascii=False))]
+                }
+            )
+    return json.dumps(out, indent=2, ensure_ascii=False)
 
-    return [TextContent(type="text", text=json.dumps({"error": f"Unknown tool: {name}"}))]
+# ------------------------------------------------------------------------------
+# HTTP app (FastAPI wrapper com health) + montagem do MCP em "/"
+# ------------------------------------------------------------------------------
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse, PlainTextResponse, Response
 
-# -------------------------------------------------------------------
-# Transport glue (STDIO & HTTP)
-# -------------------------------------------------------------------
-def _env_transport() -> str:
-    v = os.getenv("TRANSPORT", "").strip().lower()
-    if v in {"stdio", "http"}:
-        return v
-    return "stdio"
+def _build_http_app() -> FastAPI:
+    # App MCP ASGI (aceita POST /). O path="/" garante que Cursor poste na raiz.
+    mcp_app = mcp.http_app(path="/")
 
-async def _run_stdio():
-    import mcp.server.stdio
-    logger.info("Starting MCP (STDIO) …")
-    async with mcp.server.stdio.stdio_server() as (read_stream, write_stream):
-        await mcp_server.run(read_stream, write_stream, mcp_server.create_initialization_options())
-
-# ---------- HTTP: cria ASGI + health wrapper ----------
-# Importa o transporte HTTP e constrói o app no import (para uvicorn "module:var")
-_HTTP_AVAILABLE = False
-try:
-    import mcp.server.http  # precisa existir nessa versão do pacote 'mcp'
-    _HTTP_AVAILABLE = True
-except Exception as e:
-    logger.warning("mcp.server.http not available: %s", e)
-
-def _build_http_app_or_fallback():
-    """
-    Monta o app ASGI do MCP e adiciona health handlers (GET/HEAD / e favicon).
-    Se o transporte HTTP não existir, expõe fallback 503 (mas nunca retorna None).
-    """
-    from fastapi import FastAPI
-    from fastapi.responses import JSONResponse, PlainTextResponse, Response
-
-    if _HTTP_AVAILABLE:
-        try:
-            mcp_app = mcp.server.http.app_from_server(mcp_server)
-        except Exception as e:
-            logger.exception("Failed to build MCP HTTP app: %s", e)
-            mcp_app = None
-    else:
-        mcp_app = None
-
-    api = FastAPI(title="MCP Wrapper")
+    # Usamos o lifespan do mcp_app no wrapper, para iniciar/fechar corretamente
+    api = FastAPI(title="MCP Wrapper", lifespan=mcp_app.lifespan)
 
     @api.get("/", include_in_schema=False)
     async def root():
@@ -316,7 +262,7 @@ def _build_http_app_or_fallback():
             "service": "mcp-competitions-br",
             "timestamp": int(time.time()),
             "note": "POST / is the MCP endpoint.",
-            "http_transport": bool(mcp_app is not None),
+            "http_transport": True
         })
 
     @api.head("/", include_in_schema=False)
@@ -325,22 +271,22 @@ def _build_http_app_or_fallback():
 
     @api.get("/favicon.ico", include_in_schema=False)
     async def favicon():
-        # evita 404 em health de navegadores / edge
         return Response(content=b"", media_type="image/x-icon", status_code=200)
 
-    # Se o MCP HTTP estiver disponível, montamos na raiz para capturar POST /
-    if mcp_app is not None:
-        # Nossas rotas GET/HEAD/GET-favicon continuam válidas; POST / cai no MCP.
-        api.mount("/", mcp_app)
-
+    # Monta o MCP na raiz. As rotas GET/HEAD / acima continuam válidas; POST / cai no MCP.
+    api.mount("/", mcp_app)
     return api
 
-# Exposto para o uvicorn: uvicorn mcp_server:http_app
-http_app = _build_http_app_or_fallback()
+# Exposto para Uvicorn: uvicorn mcp_server:http_app
+http_app = _build_http_app()
 
-# -------------------------------------------------------------------
+# ------------------------------------------------------------------------------
 # Entrypoint
-# -------------------------------------------------------------------
+# ------------------------------------------------------------------------------
+def _env_transport() -> str:
+    v = os.getenv("TRANSPORT", "").strip().lower()
+    return v if v in {"stdio", "http"} else "stdio"
+
 if __name__ == "__main__":
     transport = _env_transport()
     if transport == "http":
@@ -350,4 +296,14 @@ if __name__ == "__main__":
         logger.info("Starting MCP (HTTP) on %s:%s …", host, port)
         uvicorn.run(http_app, host=host, port=port)
     else:
-        asyncio.run(_run_stdio())
+        # STDIO local: faz uma coleta inicial síncrona e inicia o servidor STDIO
+        logger.info("Starting MCP (STDIO) …")
+        # Populate cache once before starting (opcional)
+        try:
+            asyncio.run(periodic_update_task())
+            _first_update_done = True
+            _update_loop_started = True
+        except RuntimeError:
+            # se já houver loop ativo (ambiente especial), ignora
+            pass
+        mcp.run(transport="stdio")
