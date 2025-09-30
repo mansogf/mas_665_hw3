@@ -255,7 +255,7 @@ def _build_http_app() -> FastAPI:
     # Usamos o lifespan do mcp_app no wrapper, para iniciar/fechar corretamente
     api = FastAPI(title="MCP Wrapper", lifespan=mcp_app.lifespan)
 
-    @api.get("/", include_in_schema=False)
+    @api.get("/status", include_in_schema=False)
     async def root():
         return JSONResponse({
             "ok": True,
@@ -265,7 +265,7 @@ def _build_http_app() -> FastAPI:
             "http_transport": True
         })
 
-    @api.head("/", include_in_schema=False)
+    @api.head("/status", include_in_schema=False)
     async def root_head():
         return PlainTextResponse("", status_code=200)
 
