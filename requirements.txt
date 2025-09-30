@@ -1,0 +1,7 @@
+fastapi>=0.110,<1
+uvicorn[standard]>=0.23,<1
+httpx>=0.24,<1
+beautifulsoup4>=4.12,<5
+apscheduler>=3.10,<4
+mcp>=1.2.0
+httpie
