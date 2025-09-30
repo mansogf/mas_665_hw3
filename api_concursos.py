@@ -221,13 +221,13 @@ async def root():
     <h1>🎯 Brazilian Public Job Competitions API v2.0</h1>
     <div class="feature"><strong>✨ Features:</strong> Essential data, filters, cache, metrics</div>
     <h2>📍 Endpoints</h2>
-    <div class="endpoint"><code>GET /states/{{state}}</code> - por estado<br>
-    params: <code>status</code>=open|scheduled, <code>search</code>=texto</div>
-    <div class="endpoint"><code>GET /stats/global</code> - estatísticas</div>
-    <div class="endpoint"><code>GET /health</code> - saúde do sistema</div>
-    <h2>🗺️ Estados</h2><ul class="state-list">{state_list_html}</ul>
-    <h2>📖 Exemplos</h2>
-    <div class="endpoint"><code>/states/sp?status=open</code><br><code>/states/rj?search=prefeitura</code></div>
+    <div class="endpoint"><code>GET /states/{{state}}</code> - by state<br>
+    params: <code>status</code>=open|scheduled, <code>search</code>=text</div>
+    <div class="endpoint"><code>GET /stats/global</code> - statistics</div>
+    <div class="endpoint"><code>GET /health</code> - system health</div>
+    <h2>🗺️ States</h2><ul class="state-list">{state_list_html}</ul>
+    <h2>📖 Examples</h2>
+    <div class="endpoint"><code>/states/sp?status=open</code><br><code>/states/rj?search=municipality</code></div>
     </body></html>
     """
     return HTMLResponse(content=html)
